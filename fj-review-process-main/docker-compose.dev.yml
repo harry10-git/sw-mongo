@@ -1,0 +1,123 @@
+volumes:
+  data:
+
+
+services:
+
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    ports:
+      - 80:80
+      - 443:443
+      - 8080:8080
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+    command:
+      - --api=true
+      - --api.dashboard=true
+      - --api.insecure=true
+      - --entrypoints.http.address=:80
+      - --entrypoints.https.address=:443
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      # Redirect all HTTP to HTTPS
+      # - --entrypoints.http.http.redirections.entryPoint.to=https
+      # - --entrypoints.http.http.redirections.entryPoint.scheme=https
+
+      # Enable Let's Encrypt
+      # - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      # - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}
+      # - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      # LetsEncrypt Staging Server - uncomment when testing
+      # - --certificatesResolvers.letsencrypt.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory
+
+  mongodb:
+    image: mongo:latest
+    volumes:
+      - data:/data/db
+    restart: always  
+    env_file: .env
+    ports:
+      - 27017:27017
+    # labels:
+    #   - traefik.enable=true
+    #   - traefik.http.routers.${STACK_NAME?Variable not set}-mongodb-https.rule=Host(`mongodb.${DOMAIN?Variable not set}`)
+    #   - traefik.http.routers.${STACK_NAME?Variable not set}-mongodb-https.entrypoints=https,http
+    #   - traefik.http.routers.${STACK_NAME?Variable not set}-mongodb-https.tls.certresolver=${CERT_RESOLVER}
+    #   - traefik.http.services.${STACK_NAME?Variable not set}-mongodb.loadbalancer.server.port=5050
+
+  flower:
+    image: mher/flower
+    depends_on:
+      - traefik
+    env_file: .env
+    ports:
+      - 5555:5555
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.${STACK_NAME?Variable not set}-flower-https.rule=Host(`flower.${DOMAIN?Variable not set}`)
+      - traefik.http.routers.${STACK_NAME?Variable not set}-flower-https.entrypoints=https,http
+      - traefik.http.routers.${STACK_NAME?Variable not set}-flower-https.tls=true
+      - traefik.http.routers.${STACK_NAME?Variable not set}-flower-https.tls.certresolver=${CERT_RESOLVER}
+      - traefik.http.services.${STACK_NAME?Variable not set}-flower.loadbalancer.server.port=5555
+
+  backend:
+    image: '${DOCKER_IMAGE_BACKEND?Variable not set}:${TAG-latest}'
+    depends_on:
+      - mongodb
+      - traefik
+    env_file: .env
+    ports:
+      - 5678:5678
+      - 3000:3000
+    build:
+      context: ./backend
+    volumes:
+      - ./backend:/app
+    command:
+      [
+        "sh",
+        "-c",
+        "pip install debugpy -t /tmp && python /tmp/debugpy --wait-for-client --listen 0.0.0.0:5678 -m uvicorn main:app --host 0.0.0.0 --port 3000 --reload"
+      ]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.${STACK_NAME?Variable not set}-backend-https.entrypoints=https,http
+      - traefik.http.routers.${STACK_NAME?Variable not set}-backend-https.tls.certresolver=${CERT_RESOLVER}
+      - traefik.http.routers.${STACK_NAME?Variable not set}-backend-https.rule=Host(`api.${DOMAIN?Variable not set}`)
+      - traefik.http.services.${STACK_NAME?Variable not set}-backend.loadbalancer.server.port=3000
+
+  celeryworker:
+    image: '${DOCKER_IMAGE_BACKEND?Variable not set}:${TAG-latest}'
+    depends_on:
+      - mongodb
+      - redis
+    env_file: .env
+    ports:
+      - 6900:6900
+    command:
+      ["sh","-c","pip install debugpy -t /tmp && python /tmp/debugpy --listen 0.0.0.0:6900 -m celery -A worker worker -l info -Q main-queue -c 1"]
+    build:
+      context: ./backend
+
+  celery-beat:
+    image: '${DOCKER_IMAGE_BACKEND?Variable not set}:${TAG-latest}'
+    depends_on:
+      - mongodb
+      - redis
+    env_file: .env
+    command:
+      [
+        "sh",
+        "-c",
+        "celery -A worker beat"
+      ]
+    build:
+      context: ./backend
+
+  redis:
+    image: redis:latest
